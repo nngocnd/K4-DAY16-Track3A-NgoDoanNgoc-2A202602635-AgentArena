@@ -79,16 +79,57 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept, dropped, split = [], 0, 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text:
+                dropped += 1
+            elif ctx.saw(text):
+                kept.append(claim)  # có nguyên văn trong bằng chứng: giữ nguyên
+            else:
+                halves = self._split_blend(ctx, text)
+                if halves:
+                    kept.extend({**claim, "text": h, "doc_id": d} for h, d in halves)
+                    report["abstain"] = True  # hai nguồn mâu thuẫn
+                    split += 1
+                else:
+                    dropped += 1  # bịa: không tài liệu nào nói câu này
+
+        ctx.state["critic"] = {"kept": len(kept), "dropped": dropped, "split": split}
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
+
+    @staticmethod
+    def _split_blend(ctx, text):
+        """Cắt câu ghép tại một " và " sao cho hai nửa nằm nguyên văn trong
+        HAI tài liệu khác nhau mà agent đã đọc. Trả về [(nửa, doc_id), ...]
+        hoặc None nếu không có chỗ cắt hợp lệ."""
+        if ctx.corpus is None:
+            return None
+        seen = [d for d in ctx.corpus.docs if d.body and d.body in ctx.observed_text]
+
+        def source(part):
+            if not ctx.saw(part):
+                return None
+            return next(
+                (d.doc_id for d in seen
+                 if any(part in line for line in d.body.splitlines())),
+                None,
+            )
+
+        sep, start = " và ", 0
+        while (i := text.find(sep, start)) != -1:
+            head, tail = text[:i], text[i + len(sep):]
+            a, b = source(head), source(tail)
+            if a and b and a != b:
+                return [(head, a), (tail, b)]
+            start = i + 1
+        return None
